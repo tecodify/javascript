@@ -1,380 +1,168 @@
-/**
- * GPUComputationRenderer, based on SimulationRenderer by zz85
- *
- * The GPUComputationRenderer uses the concept of variables. These variables are RGBA float textures that hold 4 floats
- * for each compute element (texel)
- *
- * Each variable has a fragment shader that defines the computation made to obtain the variable in question.
- * You can use as many variables you need, and make dependencies so you can use textures of other variables in the shader
- * (the sampler uniforms are added automatically) Most of the variables will need themselves as dependency.
- *
- * The renderer has actually two render targets per variable, to make ping-pong. Textures from the current frame are used
- * as inputs to render the textures of the next frame.
- *
- * The render targets of the variables can be used as input textures for your visualization shaders.
- *
- * Variable names should be valid identifiers and should not collide with THREE GLSL used identifiers.
- * a common approach could be to use 'texture' prefixing the variable name; i.e texturePosition, textureVelocity...
- *
- * The size of the computation (sizeX * sizeY) is defined as 'resolution' automatically in the shader. For example:
- * #DEFINE resolution vec2( 1024.0, 1024.0 )
- *
- * -------------
- *
- * Basic use:
- *
- * // Initialization...
- *
- * // Create computation renderer
- * var gpuCompute = new THREE.GPUComputationRenderer( 1024, 1024, renderer );
- *
- * // Create initial state float textures
- * var pos0 = gpuCompute.createTexture();
- * var vel0 = gpuCompute.createTexture();
- * // and fill in here the texture data...
- *
- * // Add texture variables
- * var velVar = gpuCompute.addVariable( "textureVelocity", fragmentShaderVel, pos0 );
- * var posVar = gpuCompute.addVariable( "texturePosition", fragmentShaderPos, vel0 );
- *
- * // Add variable dependencies
- * gpuCompute.setVariableDependencies( velVar, [ velVar, posVar ] );
- * gpuCompute.setVariableDependencies( posVar, [ velVar, posVar ] );
- *
- * // Add custom uniforms
- * velVar.material.uniforms.time = { value: 0.0 };
- *
- * // Check for completeness
- * var error = gpuCompute.init();
- * if ( error !== null ) {
- *		console.error( error );
-  * }
- *
- *
- * // In each frame...
- *
- * // Compute!
- * gpuCompute.compute();
- *
- * // Update texture uniforms in your visualization materials with the gpu renderer output
- * myMaterial.uniforms.myTexture.value = gpuCompute.getCurrentRenderTarget( posVar ).texture;
- *
- * // Do your rendering
- * renderer.render( myScene, myCamera );
- *
- * -------------
- *
- * Also, you can use utility functions to create ShaderMaterial and perform computations (rendering between textures)
- * Note that the shaders can have multiple input textures.
- *
- * var myFilter1 = gpuCompute.createShaderMaterial( myFilterFragmentShader1, { theTexture: { value: null } } );
- * var myFilter2 = gpuCompute.createShaderMaterial( myFilterFragmentShader2, { theTexture: { value: null } } );
- *
- * var inputTexture = gpuCompute.createTexture();
- *
- * // Fill in here inputTexture...
- *
- * myFilter1.uniforms.theTexture.value = inputTexture;
- *
- * var myRenderTarget = gpuCompute.createRenderTarget();
- * myFilter2.uniforms.theTexture.value = myRenderTarget.texture;
- *
- * var outputRenderTarget = gpuCompute.createRenderTarget();
- *
- * // Now use the output texture where you want:
- * myMaterial.uniforms.map.value = outputRenderTarget.texture;
- *
- * // And compute each frame, before rendering to screen:
- * gpuCompute.doRenderTarget( myFilter1, myRenderTarget );
- * gpuCompute.doRenderTarget( myFilter2, outputRenderTarget );
- *
- *
- *
- * @param {int} sizeX Computation problem size is always 2d: sizeX * sizeY elements.
- * @param {int} sizeY Computation problem size is always 2d: sizeX * sizeY elements.
- * @param {WebGLRenderer} renderer The renderer
-  */
-
-THREE.GPUComputationRenderer = function ( sizeX, sizeY, renderer ) {
-
-	this.variables = [];
-
-	this.currentTextureIndex = 0;
-
-	var scene = new THREE.Scene();
-
-	var camera = new THREE.Camera();
-	camera.position.z = 1;
-
-	var passThruUniforms = {
-		passThruTexture: { value: null }
-	};
-
-	var passThruShader = createShaderMaterial( getPassThroughFragmentShader(), passThruUniforms );
-
-	var mesh = new THREE.Mesh( new THREE.PlaneBufferGeometry( 2, 2 ), passThruShader );
-	scene.add( mesh );
-
-
-	this.addVariable = function ( variableName, computeFragmentShader, initialValueTexture ) {
-
-		var material = this.createShaderMaterial( computeFragmentShader );
-
-		var variable = {
-			name: variableName,
-			initialValueTexture: initialValueTexture,
-			material: material,
-			dependencies: null,
-			renderTargets: [],
-			wrapS: null,
-			wrapT: null,
-			minFilter: THREE.NearestFilter,
-			magFilter: THREE.NearestFilter
-		};
-
-		this.variables.push( variable );
-
-		return variable;
-
-	};
-
-	this.setVariableDependencies = function ( variable, dependencies ) {
-
-		variable.dependencies = dependencies;
-
-	};
-
-	this.init = function () {
-
-		if ( ! renderer.extensions.get( "OES_texture_float" ) &&
-			 ! renderer.capabilities.isWebGL2 ) {
-
-			return "No OES_texture_float support for float textures.";
-
-		}
-
-		if ( renderer.capabilities.maxVertexTextures === 0 ) {
-
-			return "No support for vertex shader textures.";
-
-		}
-
-		for ( var i = 0; i < this.variables.length; i ++ ) {
-
-			var variable = this.variables[ i ];
-
-			// Creates rendertargets and initialize them with input texture
-			variable.renderTargets[ 0 ] = this.createRenderTarget( sizeX, sizeY, variable.wrapS, variable.wrapT, variable.minFilter, variable.magFilter );
-			variable.renderTargets[ 1 ] = this.createRenderTarget( sizeX, sizeY, variable.wrapS, variable.wrapT, variable.minFilter, variable.magFilter );
-			this.renderTexture( variable.initialValueTexture, variable.renderTargets[ 0 ] );
-			this.renderTexture( variable.initialValueTexture, variable.renderTargets[ 1 ] );
-
-			// Adds dependencies uniforms to the ShaderMaterial
-			var material = variable.material;
-			var uniforms = material.uniforms;
-			if ( variable.dependencies !== null ) {
-
-				for ( var d = 0; d < variable.dependencies.length; d ++ ) {
-
-					var depVar = variable.dependencies[ d ];
-
-					if ( depVar.name !== variable.name ) {
-
-						// Checks if variable exists
-						var found = false;
-						for ( var j = 0; j < this.variables.length; j ++ ) {
-
-							if ( depVar.name === this.variables[ j ].name ) {
-
-								found = true;
-								break;
-
-							}
-
-						}
-						if ( ! found ) {
-
-							return "Variable dependency not found. Variable=" + variable.name + ", dependency=" + depVar.name;
-
-						}
-
-					}
-
-					uniforms[ depVar.name ] = { value: null };
-
-					material.fragmentShader = "\nuniform sampler2D " + depVar.name + ";\n" + material.fragmentShader;
-
-				}
-
-			}
-
-		}
-
-		this.currentTextureIndex = 0;
-
-		return null;
-
-	};
-
-	this.compute = function () {
-
-		var currentTextureIndex = this.currentTextureIndex;
-		var nextTextureIndex = this.currentTextureIndex === 0 ? 1 : 0;
-
-		for ( var i = 0, il = this.variables.length; i < il; i ++ ) {
-
-			var variable = this.variables[ i ];
-
-			// Sets texture dependencies uniforms
-			if ( variable.dependencies !== null ) {
-
-				var uniforms = variable.material.uniforms;
-				for ( var d = 0, dl = variable.dependencies.length; d < dl; d ++ ) {
-
-					var depVar = variable.dependencies[ d ];
-
-					uniforms[ depVar.name ].value = depVar.renderTargets[ currentTextureIndex ].texture;
-
-				}
-
-			}
-
-			// Performs the computation for this variable
-			this.doRenderTarget( variable.material, variable.renderTargets[ nextTextureIndex ] );
-
-		}
-
-		this.currentTextureIndex = nextTextureIndex;
-
-	};
-
-	this.getCurrentRenderTarget = function ( variable ) {
-
-		return variable.renderTargets[ this.currentTextureIndex ];
-
-	};
-
-	this.getAlternateRenderTarget = function ( variable ) {
-
-		return variable.renderTargets[ this.currentTextureIndex === 0 ? 1 : 0 ];
-
-	};
-
-	function addResolutionDefine( materialShader ) {
-
-		materialShader.defines.resolution = 'vec2( ' + sizeX.toFixed( 1 ) + ', ' + sizeY.toFixed( 1 ) + " )";
-
-	}
-	this.addResolutionDefine = addResolutionDefine;
-
-
-	// The following functions can be used to compute things manually
-
-	function createShaderMaterial( computeFragmentShader, uniforms ) {
-
-		uniforms = uniforms || {};
-
-		var material = new THREE.ShaderMaterial( {
-			uniforms: uniforms,
-			vertexShader: getPassThroughVertexShader(),
-			fragmentShader: computeFragmentShader
-		} );
-
-		addResolutionDefine( material );
-
-		return material;
-
-	}
-
-	this.createShaderMaterial = createShaderMaterial;
-
-	this.createRenderTarget = function ( sizeXTexture, sizeYTexture, wrapS, wrapT, minFilter, magFilter ) {
-
-		sizeXTexture = sizeXTexture || sizeX;
-		sizeYTexture = sizeYTexture || sizeY;
-
-		wrapS = wrapS || THREE.ClampToEdgeWrapping;
-		wrapT = wrapT || THREE.ClampToEdgeWrapping;
-
-		minFilter = minFilter || THREE.NearestFilter;
-		magFilter = magFilter || THREE.NearestFilter;
-
-		var renderTarget = new THREE.WebGLRenderTarget( sizeXTexture, sizeYTexture, {
-			wrapS: wrapS,
-			wrapT: wrapT,
-			minFilter: minFilter,
-			magFilter: magFilter,
-			format: THREE.RGBAFormat,
-			type: ( /(iPad|iPhone|iPod)/g.test( navigator.userAgent ) ) ? THREE.HalfFloatType : THREE.FloatType,
-			stencilBuffer: false,
-			depthBuffer: false
-		} );
-
-		return renderTarget;
-
-	};
-
-	this.createTexture = function () {
-
-		var a = new Float32Array( sizeX * sizeY * 4 );
-		var texture = new THREE.DataTexture( a, sizeX, sizeY, THREE.RGBAFormat, THREE.FloatType );
-		texture.needsUpdate = true;
-
-		return texture;
-
-	};
-
-	this.renderTexture = function ( input, output ) {
-
-		// Takes a texture, and render out in rendertarget
-		// input = Texture
-		// output = RenderTarget
-
-		passThruUniforms.passThruTexture.value = input;
-
-		this.doRenderTarget( passThruShader, output );
-
-		passThruUniforms.passThruTexture.value = null;
-
-	};
-
-	this.doRenderTarget = function ( material, output ) {
-
-		var currentRenderTarget = renderer.getRenderTarget();
-
-		mesh.material = material;
-		renderer.setRenderTarget( output );
-		renderer.render( scene, camera );
-		mesh.material = passThruShader;
-
-		renderer.setRenderTarget( currentRenderTarget );
-
-	};
-
-	// Shaders
-
-	function getPassThroughVertexShader() {
-
-		return	"void main()	{\n" +
-				"\n" +
-				"	gl_Position = vec4( position, 1.0 );\n" +
-				"\n" +
-				"}\n";
-
-	}
-
-	function getPassThroughFragmentShader() {
-
-		return	"uniform sampler2D passThruTexture;\n" +
-				"\n" +
-				"void main() {\n" +
-				"\n" +
-				"	vec2 uv = gl_FragCoord.xy / resolution.xy;\n" +
-				"\n" +
-				"	gl_FragColor = texture2D( passThruTexture, uv );\n" +
-				"\n" +
-				"}\n";
-
-	}
-
-};
+;(function () {
+
+  setTimeout(function () {
+    var cstyle =
+    "line-height:2;background:#2B2E31;color:#FFB909;font-family:monospace;";
+    console.log("%c     made by the @keyframers     ", cstyle);
+    console.log("https://twitter.com/keyframers  https://youtube.com/keyframers");
+  }, 100);
+
+  var el = document.querySelector('[data-keyframers-credit]');
+
+  if (el) {
+
+
+    el.className += ' kf_credit';
+
+    var hasText = el.innerHTML.length;
+    // console.log('hasText', hasText);
+    // if ( !hasText ) { 
+    //   el.innerHTML = '<span>Watch the @keyframes code this pen live!</span>';
+    // }
+
+    el.insertAdjacentHTML('afterbegin', `
+<div class="kf_credit_logo">
+<svg viewBox="0 0 122 68" xmlns="http://www.w3.org/2000/svg" fill-rule="evenodd" clip-rule="evenodd" stroke-linecap="round" stroke-miterlimit="1.5">
+  <path d="M33.807 6.788L6.654 33.941l27.153 27.153L60.96 33.941 33.807 6.788zM88.113 6.788L60.96 33.941l27.153 27.153 27.153-27.153L88.113 6.788z" fill="none" stroke="#FFB909" stroke-width="7.2"/>
+  <path d="M60.96 0L27.019 33.941 60.96 67.882l33.941-33.941L60.96 0z" fill="#FFB909"/>
+  <path d="M70.56 43.541l-9.6-9.6 9.6-9.6M55.68 21.941V46.11" fill="none" stroke="#333" stroke-width="7.2" stroke-linecap="butt"/>
+</svg>
+</div>`);
+
+    if (!hasText) {
+      el.insertAdjacentHTML('afterbegin', '<span>Watch this tutorial</span> ');
+      el.insertAdjacentHTML('beforeend', ' <span>by the @keyframers!</span>');
+    }
+
+    document.head.insertAdjacentHTML('beforeend', `<style>
+.kf_credit {
+  position: fixed;
+  bottom: 0.5em;
+  left: 0;
+  right: 0;
+  z-index: 999;
+  margin: auto;
+  width: fit-content;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  font-family: monospace;
+  font-size: 10px;
+  line-height: 1;
+  text-align: center;
+  transition: all 0.4s cubic-bezier(.84,.01,.14,.98);
+  animation: kf_credit_slide-in 0.8s cubic-bezier(.06,.44,0,.98) 0.4s both;
+}
+@keyframes kf_credit_slide-in { from { transform: translateY(100%); opacity: 0; } }
+
+.kf_credit_logo { 
+  position: relative;
+  width: 6em;
+  height: 3em;
+  padding: .5em;
+  perspective: 400px;
+  transform-style: preserve-3d;
+}
+
+</style>`);
+
+    el.onclick = function () {
+      if (ga) {
+        var url = this.getAttribute('href');
+        ga('send', 'event', 'keyframers', 'click', url, {
+          'transport': 'beacon',
+          'hitCallback': function () {window.open(url);} });
+
+        return false;
+      }
+    };
+
+  }
+
+})();
+
+
+(function (i, s, o, g, r, a, m) {i['GoogleAnalyticsObject'] = r;i[r] = i[r] || function () {
+    (i[r].q = i[r].q || []).push(arguments);}, i[r].l = 1 * new Date();a = s.createElement(o),
+  m = s.getElementsByTagName(o)[0];a.async = 1;a.src = g;m.parentNode.insertBefore(a, m);
+})(window, document, 'script', 'https://www.google-analytics.com/analytics.js', 'ga');
+ga('create', 'UA-6412794-6', 'auto');
+ga('send', 'pageview');
+ga('send', 'event', 'keyframers');
+
+
+/*
+
+<!-- <div class="kf_credit">
+
+  <span>Watch the @keyframers</span>
+
+  <div class="kf_faces">
+
+    <svg class="kf_face -shaw" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 340 356">
+      <path fill="#bf3c26" d="M323.5 177.8L172 19.6 20.4 177.8 172 336l151.5-158.2z"/>
+      <clipPath id="a">
+        <path d="M323.5 177.8L172 19.6 20.4 177.8 172 336l151.5-158.2z"/>
+      </clipPath>
+      <g clip-path="url(#a)">
+        <circle cx="173" cy="135.9" r="100" fill="#f7bb9a"/>
+        <path fill="#bf3c26" d="M.1-29h343.7v152.7H.1z"/>
+        <circle cx="203.4" cy="176.9" r="14"/>
+        <circle cx="140.5" cy="176.9" r="14"/>
+        <path fill="#fff" fill-opacity=".1" d="M293 177.8L173 52.6V303l120-125.2z"/>
+      </g>
+      <path fill="none" stroke="#000" stroke-width="21.6" d="M323.5 177.8L172 19.6 20.4 177.8 172 336l151.5-158.2z"/>
+    </svg>
+
+    <svg class="kf_face -david" viewBox="230 0 340 356">
+
+      <path fill="#e1b39a" d="M555.6 177.8L404 19.6 252.5 177.8 404 336l151.6-158.2z"/>
+      <clipPath id="b">
+        <path d="M555.6 177.8L404 19.6 252.5 177.8 404 336l151.6-158.2z"/>
+      </clipPath>
+      <g clip-path="url(#b)">
+        <circle cx="404" cy="134.9" r="100" fill="#f7bb9a"/>
+        <path fill="#3e3430" d="M230.5-29h343.7v152.7H230.5z"/>
+        <ellipse cx="433.8" cy="176.9" rx="14" ry="14"/>
+        <ellipse cx="370.9" cy="176.9" rx="14" ry="14"/>
+        <path fill="#fff" fill-opacity=".1" d="M524 177.8L404 52.6V303l120-125.2z"/>
+      </g>
+      <path fill="none" stroke="#000" stroke-width="21.6" d="M555.6 177.8L404 19.6 252.5 177.8 404 336l151.6-158.2z"/>
+    </svg>
+  </div>
+
+  <span>build this pen live!</span>
+
+</div>
+
+
+
+<svg class="face" style="display: none" xmlns="http://www.w3.org/2000/svg" fill-rule="evenodd" stroke-linecap="round" stroke-miterlimit="1.5" clip-rule="evenodd" viewBox="0 0 575 356">
+  <path fill="#bf3c26" d="M323.5 177.8L172 19.6 20.4 177.8 172 336l151.5-158.2z"/>
+  <clipPath id="a">
+    <path d="M323.5 177.8L172 19.6 20.4 177.8 172 336l151.5-158.2z"/>
+  </clipPath>
+  <g clip-path="url(#a)">
+    <circle cx="173" cy="135.9" r="100" fill="#f7bb9a"/>
+    <path fill="#bf3c26" d="M.1-29h343.7v152.7H.1z"/>
+    <circle cx="203.4" cy="176.9" r="14"/>
+    <circle cx="140.5" cy="176.9" r="14"/>
+    <path fill="#fff" fill-opacity=".1" d="M293 177.8L173 52.6V303l120-125.2z"/>
+  </g>
+  <path fill="none" stroke="#000" stroke-width="21.6" d="M323.5 177.8L172 19.6 20.4 177.8 172 336l151.5-158.2z"/>
+
+  <path fill="#e1b39a" d="M555.6 177.8L404 19.6 252.5 177.8 404 336l151.6-158.2z"/>
+  <clipPath id="b">
+    <path d="M555.6 177.8L404 19.6 252.5 177.8 404 336l151.6-158.2z"/>
+  </clipPath>
+  <g clip-path="url(#b)">
+    <circle cx="404" cy="134.9" r="100" fill="#f7bb9a"/>
+    <path fill="#3e3430" d="M230.5-29h343.7v152.7H230.5z"/>
+    <ellipse cx="433.8" cy="176.9" rx="14" ry="14"/>
+    <ellipse cx="370.9" cy="176.9" rx="14" ry="14"/>
+    <path fill="#fff" fill-opacity=".1" d="M524 177.8L404 52.6V303l120-125.2z"/>
+  </g>
+  <path fill="none" stroke="#000" stroke-width="21.6" d="M555.6 177.8L404 19.6 252.5 177.8 404 336l151.6-158.2z"/>
+</svg>
+ -->
+ */
